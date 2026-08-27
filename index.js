@@ -6,8 +6,44 @@ import cors from 'cors';
 const app = express();
 app.use(cors());
 app.use(express.text({ type: '*/*' })); 
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
 const sessions = new Map();
+
+// --- MOCK OAUTH 2.0 FOR GEMINI SPARK ---
+
+app.get('/.well-known/oauth-authorization-server', (req, res) => {
+    const baseUrl = `${req.headers['x-forwarded-proto'] || req.protocol}://${req.headers['x-forwarded-host'] || req.get('host')}`;
+    res.json({
+        issuer: baseUrl,
+        authorization_endpoint: `${baseUrl}/authorize`,
+        token_endpoint: `${baseUrl}/token`,
+        response_types_supported: ["code"],
+        grant_types_supported: ["authorization_code", "client_credentials"]
+    });
+});
+
+app.get('/authorize', (req, res) => {
+    const redirectUri = req.query.redirect_uri;
+    const state = req.query.state;
+    if (redirectUri) {
+        // Auto-approve and redirect back to Gemini
+        res.redirect(`${redirectUri}?code=mock_auth_code&state=${state}`);
+    } else {
+        res.send('Authorized');
+    }
+});
+
+app.post('/token', (req, res) => {
+    res.json({
+        access_token: "mock_access_token",
+        token_type: "Bearer",
+        expires_in: 360000
+    });
+});
+
+// --- MCP SSE TRANSPORT ---
 
 app.get('/sse', (req, res) => {
     const sessionId = uuidv4();
@@ -18,7 +54,6 @@ app.get('/sse', (req, res) => {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('Access-Control-Allow-Origin', '*');
 
-    // Inherit the GitHub PAT from the cloud environment variables
     const env = Object.assign({}, process.env);
     
     // Spawn the MCP server silently
@@ -26,7 +61,6 @@ app.get('/sse', (req, res) => {
 
     sessions.set(sessionId, child);
 
-    // Determine the cloud URL for the POST endpoint
     const protocol = req.headers['x-forwarded-proto'] || 'http';
     const host = req.headers['x-forwarded-host'] || req.get('host');
     const endpointUrl = `${protocol}://${host}/message?id=${sessionId}`;
@@ -42,7 +76,7 @@ app.get('/sse', (req, res) => {
                     JSON.parse(trimmed);
                     res.write(`event: message\ndata: ${trimmed}\n\n`);
                 } catch(e) {
-                    console.error(`Dropped non-JSON stdout: ${trimmed}`);
+                    // Ignore non-JSON stdout
                 }
             }
         }
@@ -52,15 +86,7 @@ app.get('/sse', (req, res) => {
         console.error(`[${sessionId}] Server log:`, data.toString().trim());
     });
 
-    child.on('error', (err) => {
-        console.error(`[${sessionId}] Child error:`, err);
-    });
-
-    child.on('close', (code) => {
-        res.end();
-        sessions.delete(sessionId);
-    });
-
+    child.on('close', () => res.end());
     req.on('close', () => {
         child.kill();
         sessions.delete(sessionId);
@@ -76,7 +102,8 @@ app.post('/message', (req, res) => {
     }
 
     if (req.body) {
-        child.stdin.write(req.body + '\n');
+        const payload = typeof req.body === 'object' ? JSON.stringify(req.body) : req.body;
+        child.stdin.write(payload + '\n');
     }
     res.status(202).send('Accepted');
 });
